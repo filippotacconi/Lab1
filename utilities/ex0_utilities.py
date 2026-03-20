@@ -6,7 +6,7 @@ Risk Management - Exercise 0: Discount Factors Bootstrap
 import numpy as np
 import pandas as pd
 import datetime as dt
-from utilities.date_functions import (
+from date_functions import (
     business_date_offset,
     year_frac_act_x,
     year_frac_30e_360
@@ -28,26 +28,39 @@ def from_discount_factors_to_zero_rates(
         List[float]: List of zero rates.
     """
 
-    effDates, effDf = dates, discount_factors
-    if isinstance(effDates, pd.DatetimeIndex):   # if the input are dates, it must be converted to year fractions, if it is already year fractions, nothing to do. 
-                                                 # complete the function 
-        ref_date = effDates[0] # fix the first date as the initial date in which we consider the year fractions
-        effDates = effDates[1:] # we do not consider the first date (we would get 0 as year fraction)
-        effDf = discount_factors[1:] # we do not consider the first discount (since we are not using it)
+    
+    effDates, effDf = dates, np.array(list(discount_factors), dtype=float)
 
-        effDates = [year_frac_act_x(ref_date, t, 365) for t in effDates] # Use the function in date_functions, with act365 convention
+    # We made a control on the object of the list:
+    # The input could be a timestamp (from pandas) or a datetime (from datetime library). If so, we need to convert it 
+    # to year fraction with respect to the reference date we want by which we compute the zero rate
 
-    zero_rates=[]
-    for t, df in zip(effDates, effDf):
-        if t > 0:
-            # Formula for zero rates: Z = -ln(DF) / T
-            z = -np.log(df) / t
-            zero_rates.append(z) # adds this term to the vector
-        else:
-            # Fallback to avoid division by zero if t=0 slips through
-            zero_rates.append(0.0)
+    if len(effDates) > 0 and isinstance(effDates[0], (dt.datetime, pd.Timestamp)):  
+        reference_date = effDates[0]
+        
+        # We cut out t0 (reference date) since B(t0,t0)=1 and zero rate at t0 is undefined
 
+        effDates = effDates[1:] 
+        effDf = effDf[1:]       
+        
+        # We create an array of the year fractions with a list comprehension
+        effDates = np.array([year_frac_act_x(reference_date, d, 365) for d in effDates], dtype=float)
+    else:
+        # In this case, the input dates are already expressed in year fractions
+        # We cut out t0 (reference date) since B(t0,t0)=1 and zero rate at t0 is undefined
+        
+        effDates = np.array(list(dates[1:]), dtype=float)  
+        effDf    = effDf[1:]                                 
+
+
+    # Continuous compounding: B(t0,t) = exp(-z*t) → z = -log(B)/t
+    zero_rates = list(-np.log(effDf) / effDates)
     return zero_rates
+
+
+
+
+
 
 
 def get_discount_factor_by_zero_rates_linear_interp(
@@ -71,164 +84,216 @@ def get_discount_factor_by_zero_rates_linear_interp(
         float: Discount factor at the interpolated date.
     """
 
+    # We check that for each input date and there exist an input discount factor
     if len(dates) != len(discount_factors):
         raise ValueError("Dates and discount factors must have the same length.")
-
-    # if we already have that date in the list we just return the discount
-    if interp_date in dates:
-        # Convert dates to a list just to be safe when finding the index
-        idx = list(dates).index(interp_date)
-        return discount_factors[idx]
-    # otherwise
-
-    # compute relevant year fractions for available set of dates
-    t_arr = [year_frac_act_x(reference_date, d, 365) for d in dates] # dates for which I have the discount
-    t_interp = year_frac_act_x(reference_date, interp_date, 365) # date in which I want to find the discount factor
-    # We did it only because the previous function does not return the year fractions
     
-    # convert discounts into zero rates
-    z_arr = from_discount_factors_to_zero_rates(t_arr, discount_factors) # use the previous function implemented
+    # We compute relevant yearfractions for available set of dates
+    
+    # We use ACT/365 to compute yearfractions of the input data and create an array of them,
 
-    # we remove the first date (you don't consider it)
-    xp = t_arr[1:] if len(t_arr) > 1 else t_arr
-    fp = z_arr[1:] if len(z_arr) > 1 else z_arr
+    y_fr_dates = np.array([year_frac_act_x(reference_date, d, 365) for d in dates]) 
+    y_fr_interp = year_frac_act_x(reference_date,  interp_date,365) # year fraction related to the date
+    
+    zero_rates  = from_discount_factors_to_zero_rates(y_fr_dates, discount_factors) 
+   
+    # from_discount_factors_to_zero_rates excludes the zero rate at the reference date, so we need to cut the first y_fr_dates, which
+    # refers to the reference date
+    z_rate_int = np.interp(y_fr_interp, y_fr_dates[1:], zero_rates, right=zero_rates[-1])
+    # convert zero rate into discount
 
-    z_interp = np.interp(t_interp, xp, fp) # already given function to interpolate
-
-    # convert zero rate into discount (reverting the formula above)
-    discount = np.exp(-z_interp * t_interp)
-
-    return discount
+    discount = np.exp(-z_rate_int*y_fr_interp)
+     
+    return discount 
 
 
 def bootstrap(
-    reference_date: dt.datetime, # today
-    depo: pd.DataFrame, # pandas dataframe with rates (already absolute values)
-    futures: pd.DataFrame, # dataframe with BID/ASK rates + Settle and Expiry columns
-    swaps: pd.DataFrame, # dataframe with rates (already absolute values)
+    reference_date: dt.datetime,
+    depo: pd.DataFrame,
+    futures: pd.DataFrame,
+    swaps: pd.DataFrame,
     shock: float = 0.0,
 ) -> pd.Series:
     """
-    Bootstrap the discount factors from the given bid/ask market data.
-    - Deposit rates are used up to and including the first depo whose maturity >= settle
-      of the first future (exact settle date read from futures['Settle']).
-    - The first 7 futures are used, with exact settle/expiry dates read from
-      futures['Settle'] and futures['Expiry'].
-    - Swaps whose maturity is strictly after the expiry of the 7th future are used.
+    Bootstrap the discount factors from the given bid/ask market data. Deposit rates are used until
+    the first future settlement date (included), futures rates are used until the 2y-swap settlement.
 
     Parameters:
         reference_date (dt.datetime): Reference date.
         depo (pd.DataFrame): Deposit rates.
-        futures (pd.DataFrame): Futures rates with columns BID, ASK, Settle, Expiry.
+        futures (pd.DataFrame): Futures rates.
         swaps (pd.DataFrame): Swaps rates.
-        shock (Union[float, pd.Series]): Parallel shift to apply to the market rates, default to
-            zero.
+        shock (Union[float, pd.Series]): Shift to apply to the market rates in decimal (e.g. 1e-4 = 1bp).
+            Default to zero.
 
     Returns:
-        Tuple[pd.Series, pd.Series]: Discount factors and zero rates.
+        pd.Series: Discount factors.
     """
 
+    # initialize the list of terminal dates and discounts
     termDates, discounts = [reference_date], [1.0]
 
     #### DEPOS
+    
+    # select the correct depos and their rates
+    first_future_settle = futures.index[0] # quotation date of the first future
+    first_future_settle =  business_date_offset(first_future_settle,0, 0, day_offset = 2) #settle = quotation + 2 business day
+    
+    # We make a list of the depo dates we will use for bootstrapping
+    depoDates=depo[depo.index <= first_future_settle].index.to_list()
+    # We make an array of the depo rates needed 
+    depoRates = depo.loc[depoDates].mean(axis=1).values 
 
-    # Exact settle of the first future, read directly from the futures DataFrame
-    first_future_settle = futures.iloc[0]['Settle']
+    # We convert the deporates in decimal values FIRST
+    depoRates = depoRates / 100.0
 
-    # Include depos up to and including the first one whose maturity >= first future settle
-    mask = depo.index >= first_future_settle
-    if mask.any():
-        first_crossing_date = depo.index[mask][0]   # first depo that reaches or exceeds the settle
-        cutoff_loc = depo.index.get_loc(first_crossing_date)
-        depoDates = depo.index[:cutoff_loc + 1].to_list()
-    else:
-        # all depos mature before the first future settle: take them all
-        depoDates = depo.index.to_list()
-
-    depoRates = depo.loc[depoDates].mean(axis=1).values
+    # THEN apply the shock (already in decimal: 1e-4 = 1bp)
     depoRates = depoRates + (shock if isinstance(shock, float) else shock[depoDates].values)
 
-    for d, r in zip(depoDates, depoRates):
-        yf = year_frac_act_x(reference_date, d, 360)
-        df = 1.0 / (1.0 + r * yf)
-        termDates.append(d)
-        discounts.append(df)
+    # convert rate L(t0,ti) to discount B(t0,ti) and append the results to the current list of dates and discounts
+    
+    termDates.extend(depoDates) # We store the terminal dates
+    
+    y_fr_depo = [year_frac_act_x(reference_date, d, 360) for d in depoDates ] #We compute the year fractions and make an array by list comprehension
 
+    new_depo_disc = [1/(1+y_fr*d_rate) for y_fr,d_rate in zip(y_fr_depo, depoRates)]
+    
+    discounts.extend(new_depo_disc)
+    
+    
     #### FUTURES
 
-    # Take the first 7 futures; Settle and Expiry are already columns of the DataFrame
-    futures_7 = futures.iloc[:7]
+    # select the correct futures and their rates
+    swap_2y_date = swaps.index[1]  # maturity date of the 2y swap
+    future_dates = futures.index
+    
+    # We convert in settlement date the future dates:
+    future_settle = pd.DatetimeIndex([business_date_offset(d,day_offset= 2) for d in futures.index])
 
-    fwd_rates = futures_7[['BID', 'ASK']].mean(axis=1).values
-    fwd_rates = fwd_rates + (shock if isinstance(shock, float) else shock[futures_7.index].values)
+    # We store the expiry of the futures as a pandas index:
+    future_expiry = pd.DatetimeIndex([business_date_offset(m,month_offset= 3) for m in future_settle])
+    
+    # We keep only futures whose settle date is before or equal to the 2y swap maturity
+    
+    mask = future_expiry <= swap_2y_date # We impose the limit on the coverage of futures
+    future_settle = future_settle[mask]
+    future_expiry = future_expiry[mask]
+    future_dates = future_dates[mask]
+    
+    # We access to the prices of the futures to get the associated forward Rates:
 
-    for i, trade_date in enumerate(futures_7.index):
-        # exact settle and expiry from the futures DataFrame columns
-        t_start = futures_7.loc[trade_date, 'Settle']
-        t_end   = futures_7.loc[trade_date, 'Expiry']
+    Prices = futures.loc[future_dates,['BID','ASK']].mean(axis=1).values 
+    
+    # Futures price = 100 - fwd rate → fwd rate = (100 - Price) / 100
+    fwdRates = (100 - Prices) / 100
+    
+    # Apply the shock directly (already in decimal, no /100)
+    fwdRates = fwdRates + (shock if isinstance(shock, float) else shock[future_dates].values)
 
-        yf_fwd = year_frac_act_x(t_start, t_end, 360)
-        fwd_discount = 1.0 / (1.0 + fwd_rates[i] * yf_fwd)  # forward discount B(t0, t_start, t_end)
+    y_fr_future = [year_frac_act_x(fut_set, fut_ex, 360) for fut_set, fut_ex in zip(future_settle,future_expiry)]
+    
+    # We make a cycle to compute, from the fwd rate (ti-1,ti) the discount factors at ti:
+    for t_start,t_end,fwd_rate,y_fr in zip(future_settle,future_expiry,fwdRates,y_fr_future): 
+         
+        # convert the forward rates L(t0;ti-1, ti) to the forward discount B(t0;ti-1,ti)
+        fwd_discount = 1/(1+fwd_rate*y_fr)
 
-        # interpolate B(t0, t_start)
-        spot_discount_start = get_discount_factor_by_zero_rates_linear_interp(
-            reference_date, t_start, termDates, discounts
-        )
+        # We search for the discount B(t0;ti-1) in the already bootstrapped discounts. 
+        # If necessary, we interpolate:
 
-        # B(t0, t_end) = B(t0, t_start) * B(t_start, t_end)
-        spot_discount_end = spot_discount_start * fwd_discount
+        if t_start in termDates:
+            discounts_start = discounts[termDates.index(t_start)]
+        else:
+            discounts_start = get_discount_factor_by_zero_rates_linear_interp(reference_date, t_start, termDates, discounts)
+        
+        # We compute B(t0;ti) = B(t0;ti-1,ti)*B(t0;ti-1)
+        discount_end= discounts_start*fwd_discount
 
+        #We store the terminal dates and the associated discount factors
         termDates.append(t_end)
-        discounts.append(spot_discount_end)
+        discounts.append(discount_end)
 
+    
+   
     #### SWAPS
 
-    # Expiry of the 7th future: read directly from the futures DataFrame
-    seventh_future_expiry = futures_7.iloc[6]['Expiry']
+    # According to lecture notes: "first swap I should consider is the second"
+    # "Futures rates are used until the 2y-swap settlement"
+    # We filter swaps starting from the 2y-swap, as the expiry date of the last future could not cover the 2y-swap expiry
+    #### SWAPS
 
-    # Bootstrap only swaps whose maturity is strictly after the expiry of the 7th future
-    swaps_to_bootstrap = swaps[swaps.index > seventh_future_expiry]
+    swap_2y_date = swaps.index[1]
+    swaps_to_bootstrap = swaps[swaps.index >= swap_2y_date] # We take into account from the 2y swap
 
-    spot_date = business_date_offset(reference_date, day_offset=2)
+    swapDate = swaps_to_bootstrap.index[0] # We initialize the list
+    spot_date = reference_date #The reference date is already the settlement date
 
-    swapRates = swaps_to_bootstrap.mean(axis=1).values + (
-        shock if isinstance(shock, float) else shock[swaps_to_bootstrap.index].values
-    )
+    # Convert to decimal FIRST
+    swapRates = swaps_to_bootstrap.mean(axis=1).values / 100.0
+
+    # THEN apply the shock (already in decimal: 1e-4 = 1bp)
+    swapRates = swapRates + (shock if isinstance(shock, float) else shock[swaps_to_bootstrap.index].values)
+
+    # We make a cycle on the swaps:
+    # enumerate returns both the index and the value of each element in the iterable,
+    # we need idx to access the corresponding swap rate in swapRates
 
     for idx, swapDate in enumerate(swaps_to_bootstrap.index):
         rate = swapRates[idx]
 
-        coupon_dates = []
+        coupon_dates = [] # We initialize the list coupon dates
+
+        # We compute the coupon dates and store in a list:
+
         for year in range(1, 51):
             d_pay = business_date_offset(spot_date, year_offset=year)
             coupon_dates.append(d_pay)
-            if d_pay >= swapDate:
-                coupon_dates[-1] = swapDate
+            if d_pay >= swapDate: # If we are above the swap maturity, we stop storing coupon dates
                 break
 
-        # BPV (annuity) — sum over all coupon periods except the last
-        sum_annuity = 0.0
+            BPV = 0.0 # We initialize the Basis Point Value (t0)
         for n in range(len(coupon_dates) - 1):
-            t_prev = spot_date if n == 0 else coupon_dates[n - 1]
-            t_curr = coupon_dates[n]
+            t_prev = spot_date if n == 0 else coupon_dates[n-1] # ti-1
+            t_curr = coupon_dates[n] #ti
 
-            yf_coupon = year_frac_30e_360(t_prev, t_curr)
-            df_n = get_discount_factor_by_zero_rates_linear_interp(
-                reference_date, t_curr, termDates, discounts
-            )
-            sum_annuity += yf_coupon * df_n
+            yf_coupon = year_frac_30e_360(t_prev, t_curr) # year fraction between ti-1 and ti
 
-        # Final period
-        t_last_prev = coupon_dates[-2] if len(coupon_dates) > 1 else spot_date
-        yf_final = year_frac_30e_360(t_last_prev, swapDate)
+            # We search for discount factors in ti
+            # If not already computed, we interpolate
+            if t_curr in termDates:
+                df_n = discounts[termDates.index(t_curr)]
+            else:
+                df_n = get_discount_factor_by_zero_rates_linear_interp(
+                    reference_date, t_curr, termDates, discounts
+                )
 
-        df = (1.0 - rate * sum_annuity) / (1.0 + rate * yf_final)
+            BPV += yf_coupon * df_n #BPV = sum(year fraction(ti-1,ti)*B(t0,ti))
+            #This will be equal to BPV(t0,tN-1)
 
-        termDates.append(swapDate)
-        discounts.append(df)
+            t_last_prev = coupon_dates[-2] # We take the coupon date tN-1
+            yf_final = year_frac_30e_360(t_last_prev, swapDate) #We compute the year fraction (tN-1,tN)
+
+            # We make a control: it can happen that the 2y-swap maturity has been covered 
+        # by the futures bootstrapping, so we check: if it has happened so, we skip the iteration:
+        
+        if swapDate > termDates [-1]:
+        
+            # Bootstrap formula: B(t0,TN) = (1 - R * BPV) / (1 + R * yf_N)
+            # derived from par swap condition: 1 = R * sum(yf_i * B_i) + B_N
+
+            df = (1.0 - rate * BPV) / (1.0 + rate * yf_final)
+            
+            #We store terminal dates and discount factors
+
+            termDates.append(swapDate)
+            discounts.append(df)
+        
+        
+    # Output values are both discount factors and zero rates:
 
     discount_factors = pd.Series(index=termDates, data=discounts)
+    
     zero = from_discount_factors_to_zero_rates(discount_factors.index, discount_factors.values)
     zero_rates = pd.Series(index=termDates[1:], data=zero)
-
+    
     return discount_factors, zero_rates
