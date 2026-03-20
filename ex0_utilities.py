@@ -6,7 +6,7 @@ Risk Management - Exercise 0: Discount Factors Bootstrap
 import numpy as np
 import pandas as pd
 import datetime as dt
-from utilities.date_functions import (
+from date_functions import (
     business_date_offset,
     year_frac_act_x,
     year_frac_30e_360
