@@ -61,30 +61,30 @@ def swaption_price_calculator(
         Union[float, Tuple[float, float]]: Swaption price (and possibly delta).
     """
 
-    # Time to maturity in years (ACT/365)
+    
     ttm = year_frac_act_x(ref_date, expiry, 365)
 
-    # Black's d1 and d2
     d1 = (np.log(S0 / strike) + 0.5 * sigma_black**2 * ttm) / (sigma_black * np.sqrt(ttm))
     d2 = d1 - sigma_black * np.sqrt(ttm)
 
-    # Fixed leg payment dates of the underlying forward-starting swap
+    
     fixed_leg_payment_dates = date_series(expiry, underlying_expiry, freq)
 
-    # Forward BPV of the underlying swap (discounted from expiry onwards)
+    
     bpv = basis_point_value(fixed_leg_payment_dates[1:], discount_factors,
                             settlement_date=expiry)
 
-    # Discount factor at swaption expiry B(t0, t_alpha)
-    # Needed to bring the forward price back to t0
+    # B(t0, t_alpha): discount factor at swaption maturity 
+    # forward price back to t0
     ref = discount_factors.index[0]
     df_expiry = get_discount_factor_by_zero_rates_linear_interp(
         ref, expiry, discount_factors.index, discount_factors.values
     )
 
-    # Black's formula: Price = B(t0, t_alpha) * BPV_fwd * { ... }
+
     if swaption_type == SwapType.PAYER:
-        price = df_expiry * bpv * (S0 * norm.cdf(d1) - strike * norm.cdf(d2))
+        # using the appropriate Black's forumala
+        price = df_expiry * bpv * (S0 * norm.cdf(d1) - strike * norm.cdf(d2))  # df_expiry added
         delta = df_expiry * bpv * norm.cdf(d1)
 
     elif swaption_type == SwapType.RECEIVER:
@@ -118,37 +118,27 @@ def irs_proxy_duration(
     Returns:
         (float): Swap duration.
     """
-
-
-    ref = discount_factors.index[0]
+   
+    ref   = discount_factors.index[0]
     dates = discount_factors.index
-    dfs = discount_factors.values
+    dfs   = discount_factors.values
 
-    # Year fractions for coupon periods (30E/360 convention)
+    # 30E/360 year fractions for each coupon period
     year_fracs = schedule_year_fraction([ref_date] + list(fixed_leg_payment_dates))
 
-    numerator = 0.0
-    denominator = 0.0
-
+    numerator, denominator = 0.0, 0.0
     for i, dt in enumerate(fixed_leg_payment_dates):
-        # Discount factor at payment date
-        df = get_discount_factor_by_zero_rates_linear_interp(ref, dt, dates, dfs)
+        df  = get_discount_factor_by_zero_rates_linear_interp(ref, dt, dates, dfs)
+        t_i = year_frac_act_x(ref_date, dt, 365)  # ACT/365: real time weight for duration
 
-        # Time from ref_date to payment date (ACT/365, real time for duration)
-        t_i = year_frac_act_x(ref_date, dt, 365)
+        # Coupon + principal at maturity (replicates fixed bond cash flow)
+        cf = swap_rate * year_fracs[i] + (1.0 if i == len(fixed_leg_payment_dates) - 1 else 0.0)
 
-        # Bond cash flow: coupon at every date, plus principal at maturity
-        cf = swap_rate * year_fracs[i]
-        if i == len(fixed_leg_payment_dates) - 1:
-            cf += 1.0
-
-        numerator += cf * t_i * df
+        numerator   += cf * t_i * df
         denominator += cf * df
 
-    mac_duration = numerator / denominator
-
-    # Negative sign: receiver IRS loses value when rates increase
-    return -mac_duration
+    # Macaulay duration; negative because a receiver IRS loses value when rates rise
+    return -(numerator / denominator)
 
 
 def basis_point_value(
@@ -168,28 +158,20 @@ def basis_point_value(
     Returns:
         float: Basis point value.
     """
-    # Extract reference date and discount curve data
     ref_date = discount_factors.index[0]
-    dates = discount_factors.index
-    dfs = discount_factors.values
+    dates    = discount_factors.index
+    dfs      = discount_factors.values
 
-    # Build the full schedule: start date + payment dates
-    start = settlement_date if settlement_date is not None else ref_date
-    full_schedule = [start] + list(fixed_leg_schedule)
+    # Full schedule and 30E/360 year fractions
+    start         = settlement_date if settlement_date is not None else ref_date
+    year_fracs    = schedule_year_fraction([start] + list(fixed_leg_schedule))
 
-    # Compute year fractions between consecutive dates (30E/360 convention)
-    year_fracs = schedule_year_fraction(full_schedule)
-
-    # For forward-starting swaps, divide by B(t0, t_settlement) to get forward discounts
-    # For spot swaps, this is simply 1.0
+    # Forward adjustment: 1.0 for spot swaps, B(t0, t_settlement) for forward-starting
     df_settlement = (
         get_discount_factor_by_zero_rates_linear_interp(ref_date, settlement_date, dates, dfs)
-        if settlement_date is not None
-        else 1.0
+        if settlement_date is not None else 1.0
     )
 
-    # BPV = sum of year_frac(t_{i-1}, t_i) * B_fwd(t0; t_settlement, t_i)
-    # where B_fwd = B(t0, t_i) / B(t0, t_settlement)
     bpv = sum(
         yf * get_discount_factor_by_zero_rates_linear_interp(ref_date, dt, dates, dfs) / df_settlement
         for yf, dt in zip(year_fracs, fixed_leg_schedule)
@@ -217,30 +199,22 @@ def swap_par_rate(
     """
 
     ref_date = discount_factors.index[0]
-    dates = discount_factors.index
-    dfs = discount_factors.values
+    dates    = discount_factors.index
+    dfs      = discount_factors.values
 
-    # Forward BPV if forward-starting, spot BPV otherwise
-    bpv = basis_point_value(fixed_leg_schedule, discount_factors,
-                            settlement_date=fwd_start_date)
+    bpv = basis_point_value(fixed_leg_schedule, discount_factors, settlement_date=fwd_start_date)
 
-    # B(t0, t_n): discount factor at forward start date
-    if fwd_start_date is not None:
-        df_start = get_discount_factor_by_zero_rates_linear_interp(
-            ref_date, fwd_start_date, dates, dfs
-        )
-    else:
-        df_start = 1.0
-
-    # B(t0, t_N): discount factor at last payment date
-    df_end = get_discount_factor_by_zero_rates_linear_interp(
-        ref_date, fixed_leg_schedule[-1], dates, dfs
+    # B(t0, t_start): 1.0 for spot swaps, interpolated for forward-starting
+    df_start = (
+        get_discount_factor_by_zero_rates_linear_interp(ref_date, fwd_start_date, dates, dfs)
+        if fwd_start_date is not None else 1.0
     )
 
-    # Float leg in forward terms: 1 - B(t0, t_N) / B(t0, t_n)
-    # Spot case: df_start = 1.0, so float_leg = 1 - B(t0, t_N)
-    float_leg = 1.0 - df_end / df_start
+    # B(t0, t_N): terminal discount factor
+    df_end = get_discount_factor_by_zero_rates_linear_interp(ref_date, fixed_leg_schedule[-1], dates, dfs)
 
+    # Par condition: R = (B_start - B_end) / BPV  (float leg = 1 - B_end/B_start in forward terms)
+    float_leg = 1.0 - df_end / df_start
     return float_leg / bpv
 
 
@@ -264,26 +238,31 @@ def swap_mtm(
         float: Swap mark-to-market.
     """
 
-    # Spot BPV (no settlement_date needed for spot swaps)
+    # Single curve framework, returns price and basis point value 
     bpv = basis_point_value(fixed_leg_schedule, discount_factors)
 
-    # Discount factor at last payment date
+    # Discount factor at last date
     P_term = get_discount_factor_by_zero_rates_linear_interp(
-        discount_factors.index[0], fixed_leg_schedule[-1],
-        discount_factors.index, discount_factors.values,
+        discount_factors.index[0],
+        fixed_leg_schedule[-1],
+        discount_factors.index,
+        discount_factors.values,
     )
 
-    # Float leg value: 1 - B(t0, tN) (telescopic sum in single-curve)
     float_leg = 1.0 - P_term
 
-    # Fixed leg value: S * BPV
     fixed_leg = swap_rate * bpv
 
-    # Payer: receives float, pays fixed -> MtM = float - fixed
-    # Receiver: receives fixed, pays float -> MtM = fixed - float
+    # Payer: receives float, pays fixed 
+    # Receiver: receives fixed, pays float 
+    # error corrected (switched payer and receiver)
     if swap_type == SwapType.PAYER:
-        return float_leg - fixed_leg
+        muliplier = 1
     elif swap_type == SwapType.RECEIVER:
-        return fixed_leg - float_leg
+        muliplier = -1
     else:
         raise ValueError("Unknown swap type.")
+    
+    return muliplier * (float_leg - fixed_leg)
+    
+
